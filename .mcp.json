@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "civil3d": {
+      "command": "node",
+      "args": ["./build/index.js"],
+      "env": {
+        "CIVIL3D_TOKEN_PATH": "/mnt/c/Users/A02185374/AppData/Local/civil3d-mcp/token"
+      }
+    }
+  }
+}

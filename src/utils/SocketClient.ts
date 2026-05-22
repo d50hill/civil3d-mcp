@@ -3,6 +3,7 @@ import { createLogger } from "./logger.js";
 
 const log = createLogger("SocketClient");
 const COMMAND_TIMEOUT_MS = parseInt(process.env.CIVIL3D_COMMAND_TIMEOUT ?? "120000", 10);
+const MAX_RESPONSE_BYTES = 1_048_576;
 
 export class ApplicationClientConnection {
   host: string;
@@ -11,10 +12,12 @@ export class ApplicationClientConnection {
   isConnected: boolean = false;
   responseCallbacks: Map<string, (response: string) => void> = new Map();
   buffer: string = "";
+  private readonly authToken: string;
 
-  constructor(host: string, port: number) {
+  constructor(host: string, port: number, authToken: string) {
     this.host = host;
     this.port = port;
+    this.authToken = authToken;
     this.socket = new net.Socket();
     this.setupSocketListeners();
   }
@@ -27,6 +30,13 @@ export class ApplicationClientConnection {
 
     this.socket.on("data", (data) => {
       this.buffer += data.toString();
+      if (this.buffer.length > MAX_RESPONSE_BYTES) {
+        log.warn("Response too large; closing socket", { bytes: this.buffer.length });
+        this.rejectAllPending(`Response exceeded ${MAX_RESPONSE_BYTES} bytes`);
+        this.buffer = "";
+        this.socket.destroy();
+        return;
+      }
       this.processBuffer();
     });
 
@@ -41,6 +51,13 @@ export class ApplicationClientConnection {
     });
   }
 
+  private rejectAllPending(reason: string): void {
+    for (const [id, cb] of this.responseCallbacks) {
+      cb(JSON.stringify({ id, error: { message: reason } }));
+    }
+    this.responseCallbacks.clear();
+  }
+
   /**
    * Attempt to parse the buffer as a complete JSON object.
    * If parsing fails, the data is incomplete — wait for more.
@@ -48,7 +65,6 @@ export class ApplicationClientConnection {
   private processBuffer(): void {
     try {
       JSON.parse(this.buffer);
-      // If parsing succeeds, we have a complete JSON response
       this.handleResponse(this.buffer);
       this.buffer = "";
     } catch {
@@ -96,6 +112,7 @@ export class ApplicationClientConnection {
 
   /**
    * Send a JSON-RPC command to the Civil 3D plugin and wait for a response.
+   * The shared-secret auth token is attached to every request.
    */
   public sendCommand(command: string, params: any = {}): Promise<any> {
     return new Promise((resolve, reject) => {
@@ -108,6 +125,7 @@ export class ApplicationClientConnection {
 
         const commandObj = {
           jsonrpc: "2.0",
+          auth: this.authToken,
           method: command,
           params: params,
           id: requestId,
@@ -117,9 +135,19 @@ export class ApplicationClientConnection {
           try {
             const response = JSON.parse(responseData);
             if (response.error) {
-              reject(
-                new Error(response.error.message || "Unknown error from Civil 3D plugin")
-              );
+              const code = response.error.code as string | undefined;
+              const message = response.error.message || "Unknown error from Civil 3D plugin";
+              if (code === "CIVIL3D.UNAUTHORIZED") {
+                reject(
+                  new Error(
+                    `Civil 3D plugin rejected the auth token. ` +
+                      `Restart Civil 3D and the MCP server so both reload the current token. ` +
+                      `(${message})`
+                  )
+                );
+              } else {
+                reject(new Error(message));
+              }
             } else {
               resolve(response.result);
             }

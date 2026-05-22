@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json.Nodes;
 using Autodesk.AutoCAD.ApplicationServices;
 using Autodesk.Civil.ApplicationServices;
@@ -7,7 +8,7 @@ namespace Civil3DMcpPlugin;
 
 /// <summary>
 /// Routes JSON-RPC methods. With code execution architecture,
-/// only 2 methods are needed: executeCode and listSkills.
+/// only 2 methods are needed: executeCode and getCivil3DHealth.
 /// </summary>
 public static class CommandDispatcher
 {
@@ -29,7 +30,8 @@ public static class CommandDispatcher
   }
 
   /// <summary>
-  /// Execute C# code via Roslyn in the Civil 3D context.
+  /// Execute C# code via Roslyn in the Civil 3D context. Every invocation is
+  /// recorded in the audit log so the user can review what the AI actually ran.
   /// </summary>
   private static async Task<object?> ExecuteCodeAsync(JsonObject? parameters)
   {
@@ -37,21 +39,48 @@ public static class CommandDispatcher
     var readOnly = parameters?["readOnly"]?.GetValue<bool>() ?? false;
     var description = PluginRuntime.GetOptionalString(parameters, "description") ?? "Script execution";
 
-    // Log the execution
-    System.Diagnostics.Debug.WriteLine($"[C3D-MCP] {(readOnly ? "QUERY" : "EXECUTE")}: {description}");
+    var mode = readOnly ? "QUERY" : "EXECUTE";
+    var codeHash = RoslynExecutor.HashCode(code);
+    var sw = Stopwatch.StartNew();
 
-    // Execute on Civil 3D main thread with proper document locking
-    return await CivilExecution.ExecuteAsync((doc, civilDoc, db, tr) =>
+    try
     {
-      var context = new ScriptContext(doc, civilDoc, db, tr);
+      var result = await CivilExecution.ExecuteAsync((doc, civilDoc, db, tr) =>
+      {
+        var context = new ScriptContext(doc, civilDoc, db, tr);
+        var task = RoslynExecutor.ExecuteAsync(code, context, readOnly);
+        task.Wait();
+        return task.Result;
+      }, write: !readOnly);
 
-      // Run the Roslyn script synchronously within the command context
-      // (we're already on the main thread here)
-      var task = RoslynExecutor.ExecuteAsync(code, context);
-      task.Wait(); // Safe because we're in ExecuteInCommandContextAsync
+      sw.Stop();
+      AuditLog.Write(new AuditLog.Entry(
+        Timestamp: DateTime.UtcNow.ToString("o"),
+        Mode: mode,
+        Description: description,
+        CodeHash: codeHash,
+        CodePreview: AuditLog.Preview(code),
+        DurationMs: sw.Elapsed.TotalMilliseconds,
+        Status: "ok"));
 
-      return task.Result;
-    }, write: !readOnly);
+      return result;
+    }
+    catch (Exception ex)
+    {
+      sw.Stop();
+      AuditLog.Write(new AuditLog.Entry(
+        Timestamp: DateTime.UtcNow.ToString("o"),
+        Mode: mode,
+        Description: description,
+        CodeHash: codeHash,
+        CodePreview: AuditLog.Preview(code),
+        DurationMs: sw.Elapsed.TotalMilliseconds,
+        Status: "error",
+        Error: ex is AggregateException agg && agg.InnerException != null
+          ? agg.InnerException.Message
+          : ex.Message));
+      throw;
+    }
   }
 
   /// <summary>Health check — verifies the plugin is alive and Civil 3D is responsive.</summary>

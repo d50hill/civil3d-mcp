@@ -84,8 +84,13 @@ public sealed class RpcTcpServer
     }
   }
 
+  /// <summary>Cap on a single request payload. Larger inputs are rejected to
+  /// prevent unbounded memory growth from a malformed or hostile sender.</summary>
+  public const int MaxRequestBytes = 1_048_576;
+
   /// <summary>
   /// Reads from the stream until a valid JSON object can be parsed.
+  /// Aborts (returns empty) if the cumulative byte count exceeds <see cref="MaxRequestBytes"/>.
   /// </summary>
   private static async Task<string> ReadSingleJsonObjectAsync(
     NetworkStream stream,
@@ -93,6 +98,7 @@ public sealed class RpcTcpServer
   {
     var buffer = new byte[8192];
     var builder = new StringBuilder();
+    var totalBytes = 0;
 
     while (!cancellationToken.IsCancellationRequested)
     {
@@ -100,6 +106,13 @@ public sealed class RpcTcpServer
       if (bytesRead <= 0)
       {
         break;
+      }
+
+      totalBytes += bytesRead;
+      if (totalBytes > MaxRequestBytes)
+      {
+        // Caller treats empty as a parse error and emits an error response.
+        return string.Empty;
       }
 
       builder.Append(Encoding.UTF8.GetString(buffer, 0, bytesRead));

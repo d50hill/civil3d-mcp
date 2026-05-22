@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -26,8 +26,8 @@ public sealed class JsonRpcDispatchException : Exception
 }
 
 /// <summary>
-/// Manages the plugin lifecycle: starts/stops the TCP server,
-/// handles raw JSON-RPC requests, and provides parameter extraction helpers.
+/// Manages the plugin lifecycle: starts/stops the TCP server, handles raw JSON-RPC
+/// requests, and provides parameter extraction helpers.
 /// </summary>
 public static class PluginRuntime
 {
@@ -44,6 +44,7 @@ public static class PluginRuntime
     lock (Sync)
     {
       if (_server != null) return;
+      AuthToken.GenerateAndPersist();
       _server = new RpcTcpServer(Port, HandleRawRequestAsync);
       _server.Start();
     }
@@ -58,6 +59,7 @@ public static class PluginRuntime
       _currentOperation = null;
       _activeOperations = 0;
       _queueDepth = 0;
+      AuthToken.Clear();
     }
   }
 
@@ -75,13 +77,18 @@ public static class PluginRuntime
   }
 
   /// <summary>
-  /// Parses a raw JSON-RPC request string, dispatches to the appropriate
-  /// command handler, and returns the serialized JSON-RPC response.
+  /// Parses a raw JSON-RPC request, validates the auth token, dispatches to the
+  /// appropriate command handler, and returns the serialized JSON-RPC response.
   /// </summary>
   public static async Task<string> HandleRawRequestAsync(
     string rawRequest,
     CancellationToken cancellationToken)
   {
+    if (string.IsNullOrWhiteSpace(rawRequest))
+    {
+      return SerializeError(null, "CIVIL3D.INVALID_INPUT", "Empty or oversized request.");
+    }
+
     JsonNode? parsed;
     try
     {
@@ -98,6 +105,16 @@ public static class PluginRuntime
     }
 
     var id = request["id"]?.DeepClone();
+
+    // Authenticate before doing anything else.
+    var auth = request["auth"]?.GetValue<string?>();
+    if (!AuthToken.Validate(auth))
+    {
+      return SerializeError(id, "CIVIL3D.UNAUTHORIZED",
+        "Request missing or has invalid auth token. " +
+        "Ensure the MCP server runs as the same Windows user as Civil 3D.");
+    }
+
     var method = request["method"]?.GetValue<string>();
     var parameters = request["params"] as JsonObject;
 
@@ -106,27 +123,39 @@ public static class PluginRuntime
       return SerializeError(id, "CIVIL3D.INVALID_INPUT", "JSON-RPC request is missing method.");
     }
 
-    lock (Sync) { _queueDepth++; }
+    lock (Sync)
+    {
+      _activeOperations++;
+      _currentOperation = method;
+    }
 
     try
     {
-      lock (Sync)
-      {
-        _queueDepth--;
-        _activeOperations++;
-        _currentOperation = method;
-      }
-
       var result = await CommandDispatcher.DispatchAsync(method, parameters, cancellationToken);
       return SerializeResult(id, result);
     }
     catch (JsonRpcDispatchException ex)
     {
+      // Structured, intentional errors are safe to surface as-is.
       return SerializeError(id, ex.Code, ex.Message);
     }
     catch (Exception ex)
     {
-      return SerializeError(id, "CIVIL3D.TRANSACTION_FAILED", ex.Message);
+      // Generic exceptions may contain file paths or other internal state — sanitize.
+      var correlationId = Guid.NewGuid().ToString("N").Substring(0, 8);
+      Debug.WriteLine($"[C3D-MCP] Unhandled exception (ref {correlationId}): {ex}");
+      AuditLog.Write(new AuditLog.Entry(
+        Timestamp: DateTime.UtcNow.ToString("o"),
+        Mode: "INTERNAL",
+        Description: $"Unhandled exception in {method}",
+        CodeHash: "",
+        CodePreview: "",
+        DurationMs: 0,
+        Status: "error",
+        Error: ex.ToString(),
+        CorrelationId: correlationId));
+      return SerializeError(id, "CIVIL3D.INTERNAL_ERROR",
+        $"Internal error (ref: {correlationId}). See plugin audit log for details.");
     }
     finally
     {

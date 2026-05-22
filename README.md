@@ -117,14 +117,39 @@ C3DMCPSTATUS → verify running
 
 ## Security
 
-The Roslyn sandbox blocks:
-- Process execution (`Process.Start`)
-- File deletion (`File.Delete`)
-- Network requests (`HttpClient`, `Sockets`)
-- Registry access
-- Dynamic assembly loading
+This MCP gives the AI the ability to execute arbitrary C# inside Civil 3D, so
+the surface needs serious defenses. See **[SECURITY.md](SECURITY.md)** for the
+full security model and an integration-test checklist.
 
-All Civil 3D API operations are allowed.
+Short version:
+
+1. **Sandbox.** Roslyn `SemanticModel` walk rejects anything that references
+   `System.IO`, `System.Net`, `System.Reflection`,
+   `System.Runtime.InteropServices`, `Microsoft.Win32`, `Process`, `Activator`,
+   `AppDomain`, `Type.GetType(string)`, `Environment.Exit`, `dynamic`,
+   `unsafe`, `stackalloc`, or `[DllImport]`. Aliases and `using static` are
+   resolved, so `using P = System.Diagnostics.Process;` is caught.
+2. **Read-only enforcement.** `civil3d_query` rejects `OpenMode.ForWrite` and
+   `Transaction.Commit` at the script-validation level — read-only is no
+   longer just "the transaction isn't committed."
+3. **TCP authentication.** The plugin writes a 256-bit shared-secret token to
+   `%LOCALAPPDATA%\civil3d-mcp\token` with a user-only ACL on every start.
+   Every JSON-RPC request must carry that token; any other local process is
+   rejected with `CIVIL3D.UNAUTHORIZED`.
+4. **Audit log.** Every execution (success or failure, including the full code
+   preview, hash, mode, duration, and any error) is appended to
+   `%LOCALAPPDATA%\civil3d-mcp\audit\<yyyy-MM-dd>.log`. Review it.
+5. **Input size caps.** 64 KB per script (rejected at the MCP tool layer) and
+   1 MB per JSON-RPC payload (rejected at the socket).
+6. **Sanitized errors.** Unhandled exceptions return a correlation ID; the
+   full stack trace stays in the plugin audit log.
+
+### Known limitation: prompt injection
+
+Layer names, block descriptions, XData, or filenames in a DWG can flow back
+into the AI's context. A maliciously crafted drawing can therefore influence
+the code the AI generates. **Do not load untrusted DWG files while this MCP
+plugin is active.** Review the audit log periodically.
 
 ## License
 
